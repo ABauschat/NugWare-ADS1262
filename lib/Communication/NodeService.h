@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include "Node.h"
+#include "Router.h"
 #include "MessageTypes.h"
 
 namespace NuggetsInc {
@@ -12,7 +13,7 @@ namespace NuggetsInc {
 // split responsibilities while keeping risk low.
 class NodeService {
 public:
-    explicit NodeService(Node* node) : node_(node) {}
+    explicit NodeService(Node* node);
 
     // Convenience: build a command message and send it blocking with ACK
     // Defaults preserve current DisplayUtils policy (100ms, up to 2 retries)
@@ -39,21 +40,24 @@ public:
     bool sendSync(const char* macData = nullptr);
     bool sendAck(uint32_t originalMessageID, const char* originalPath = nullptr);
 
+    void createPathWithMac(struct_message& out, uint8_t* mac);
+    void setMessageID(struct_message& out, uint32_t messageID);
+    void setPath(struct_message& out, const char* path);
+
     // Pass-through helpers (simplified)
     inline String lastRouteInfo() const { return String("DIRECT"); }
     inline void setRouteMode(Node::RouteMode m) { /* no-op - always direct */ }
 
-private:
     static void buildCommandMessage(struct_message& out,
                                     uint8_t commandID,
                                     const char* data);
     static void buildAckMessage(struct_message& out,
                                 uint32_t originalMessageID,
                                 const char* originalPath);
-    static void buildProbeMessage(struct_message& out,
-                                  uint32_t messageID);
+    static void buildProbeMessage(struct_message& out, uint8_t* destinationMac, uint8_t* senderMac);
 
     Node* node_;
+    Router* router_;
 };
 
 } // namespace NuggetsInc

@@ -19,6 +19,7 @@ namespace NuggetsInc {
 class HandleEvents;
 class Router;
 class MessageHandler;
+class NodeService;
 
 class Node
 {
@@ -33,6 +34,12 @@ public:
     bool sendDataNonBlocking(const struct_message &msg);
     bool isPeerIntialized();
     static Node* getActiveInstance();
+    void probeMesh();
+    void probeDirect(struct_message msg);
+    const int probes = 5;
+
+    void RelayEstablished(uint8_t commandID, const char* path);
+    std::map<String, std::set<uint8_t>> pathCommandMap;
 
     void setRouteMode(RouteMode mode) { routeMode_ = mode; }
     String getLastRouteInfo() const { 
@@ -55,11 +62,13 @@ private:
     static void onDataSentCallback(const uint8_t *mac_addr, esp_now_send_status_t status);
     static void onDataRecvCallback(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
     void addPeer(const uint8_t *mac_addr);
+    static void RelayEstablishedTask(void* pvParameters);
 
     // Delegated components
     Router* router_;
     RouteMode routeMode_ = RouteMode::AUTO;
     MessageHandler* messageHandler_;
+    NodeService* nodeService;
 
 
     void handleOnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);

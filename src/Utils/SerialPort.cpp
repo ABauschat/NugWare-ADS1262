@@ -4,7 +4,10 @@
 namespace NuggetsInc {
 
 void SerialPort::begin() {
-    Serial.begin(115200);
+	// Ensure Serial is using the hardware UART connected to the USB-UART bridge
+	// (UART0: RX=GPIO44, TX=GPIO43). This keeps SerialPort output on the same
+	// pins as the ROM bootloader so we see all messages on the same COM port.
+	Serial.begin(115200, SERIAL_8N1, 44, 43);
 
     version();
 

@@ -1,7 +1,8 @@
 #include "HandleEvents.h"
+#include "NodeService.h"
 #include "Node.h"
 #include <string.h>
-#include "MessageTypes.h"  // for command ID definitions
+#include "MessageTypes.h"
 
 namespace NuggetsInc {
 

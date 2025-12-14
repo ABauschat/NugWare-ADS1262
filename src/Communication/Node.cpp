@@ -1,11 +1,13 @@
 // Node.cpp - Simplified ESP-NOW communication node
+#include "NodeService.h"
 #include "Node.h"
 #include "Router.h"
 #include "MessageHandler.h"
-#include "NodeService.h"
 #include "MacAddressStorage.h"
+#include "HandleEvents.h"
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
+#include <algorithm>
 
 namespace NuggetsInc
 {
@@ -13,28 +15,25 @@ namespace NuggetsInc
 
     Node::Node() : peerIntialized(false), InitializeMenu(false)
     {
-        // Initialize the peer MAC address to all 0xFF
         memset(peerMAC, 0xFF, sizeof(peerMAC));
+        memset(selfMAC_, 0, sizeof(selfMAC_));
 
-        // Initialize the outgoing message queue
         outgoingQueue = xQueueCreate(10, sizeof(struct_message));
         if (outgoingQueue == nullptr) {
             Serial.println("Failed to create outgoing message queue");
         }
 
-        // Initialize the mutex for the ackSemaphores map
         mapMutex = xSemaphoreCreateMutex();
         if (mapMutex == nullptr) {
             Serial.println("Failed to create mutex for ackSemaphores");
         }
 
-        setSelfMac(selfMAC_);
-
-        // Create delegated components
+        // DO NOT call WiFi functions here - WiFi is not initialized yet!
+        // setSelfMac will be called in begin() instead
         router_ = new Router();
-        NodeService* nodeService = new NodeService(this);
+        nodeService = new NodeService(this);
         messageHandler_ = new MessageHandler(router_, nodeService, this);
-        messageHandler_->setSelfMac(selfMAC_);
+        // messageHandler_->setSelfMac will be called in begin() after WiFi is ready
         routeMode_ = RouteMode::AUTO;
     }
 
@@ -54,38 +53,150 @@ namespace NuggetsInc
 
     void Node::begin()
     {
-        Serial.println("Begin Node Initialization");
-        Serial.flush();
+        printf("Begin Node Initialization\n");
 
-        // Initialize MAC address storage
+        // Initialize MAC address now that WiFi is ready
+        printf("[Node] Initializing self MAC address...\n");
+        setSelfMac(selfMAC_);
+        messageHandler_->setSelfMac(selfMAC_);
+        printf("[Node] Self MAC address initialized\n");
+
+        printf("[Node] Getting MacAddressStorage instance...\n");
         MacAddressStorage &macStorage = MacAddressStorage::getInstance();
+
+        printf("[Node] Initializing MAC address storage...\n");
         if (!macStorage.init()) {
-            Serial.println("Warning: Failed to initialize MAC address storage");
+            printf("Warning: Failed to initialize MAC address storage\n");
         }
+        printf("[Node] MAC storage initialized\n");
 
         activeInstance = this;
-
-        // Initialize WiFi for ESP-NOW
+        printf("[Node] Setting WiFi mode to STA...\n");
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
         WiFi.setSleep(false);
         esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+        printf("%s\n", WiFi.macAddress().c_str());
 
-        Serial.print("Device MAC Address: ");
-        Serial.println(WiFi.macAddress());
-
-        // Initialize ESP-NOW
+        printf("[Node] Initializing ESP-NOW...\n");
         if (esp_now_init() != ESP_OK) {
-            Serial.println("ESP-NOW initialization failed.");
+            printf("ESP-NOW initialization failed.\n");
+            return;
+        }
+        printf("[Node] ESP-NOW initialized\n");
+
+        printf("[Node] Registering callbacks...\n");
+        esp_now_register_send_cb(onDataSentCallback);
+        esp_now_register_recv_cb(onDataRecvCallback);
+        printf("[Node] Callbacks registered\n");
+
+        printf("[Node] Creating outgoing queue task...\n");
+        xTaskCreate(processOutgoingQueueTask, "OutgoingQueue", 4096, this, 1, NULL);
+        printf("[Node] Node initialization complete\n");
+    }
+
+    void Node::probeDirect(struct_message msg) {
+        nodeService->createPathWithMac(msg, peerMAC);
+        for (int i = 0; i < probes; i++) {
+            nodeService->setMessageID(msg, now_ms());
+            sendDataNonBlocking(msg);
+            Serial.println("Probe " + String(i) + " sent to: " + Router::pathToString(msg.path));
+            vTaskDelay(pdMS_TO_TICKS(random(50, 60)));
+        }
+    }
+
+    void Node::probeMesh() {
+        struct_message msg;
+        nodeService->buildProbeMessage(msg, peerMAC, selfMAC_);
+        MacAddressStorage &macStorage = MacAddressStorage::getInstance();
+        std::vector<String> macAddresses = macStorage.getAllMacAddresses();
+        std::vector<uint8_t*> macAddressList = Router::stringToMacArray(macAddresses);
+        pathCommandMap.clear();
+
+        if (macAddresses.empty()) {
+            Serial.println("No MAC addresses to probe");
             return;
         }
 
-        // Register callbacks
-        esp_now_register_send_cb(onDataSentCallback);
-        esp_now_register_recv_cb(onDataRecvCallback);
+        probeDirect(msg);
+        vTaskDelay(pdMS_TO_TICKS(100));
 
-        // Create outgoing message processing task
-        xTaskCreate(processOutgoingQueueTask, "OutgoingQueue", 4096, this, 1, NULL);
+        for (uint8_t* mac : macAddressList) {
+            if (memcmp(mac, selfMAC_, 6) == 0) { continue; }
+            if (memcmp(mac, peerMAC, 6) == 0) { continue; }
+
+            nodeService->createPathWithMac(msg, mac);
+
+            for (int i = 0; i < probes; i++) {
+                nodeService->setMessageID(msg, now_ms());
+                sendDataNonBlocking(msg);
+                Serial.println("Probe " + String(i) + " sent to: " + Router::pathToString(msg.path));
+                vTaskDelay(pdMS_TO_TICKS(random(50, 60)));
+            }
+        }
+
+        xTaskCreate(RelayEstablishedTask, "RelayEstablishedTask", 4096, this, 1, NULL);
+    }
+
+    void Node::RelayEstablished(uint8_t commandID, const char* path) {
+        msec32 responseTime = now_ms() - commandID;
+        String pathString = Router::pathToString(path);
+        pathCommandMap[pathString].insert(responseTime);
+        Serial.println("Relay established for path: " + pathString);
+    }
+
+    void Node::RelayEstablishedTask(void* pvParameters) {
+        Node* node = static_cast<Node*>(pvParameters);
+        if (!node) {
+            Serial.println("Invalid node instance in RelayEstablishedTask");
+            vTaskDelete(NULL); 
+            return;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(3000));
+
+        // Convert map to vector for processing
+        std::vector<std::pair<String, std::set<uint8_t>>> pathCommandVector;
+        for (const auto& pair : node->pathCommandMap) {
+            pathCommandVector.push_back(pair);
+        }
+
+        // Remove all that appear in the dataset at a lower frqeuncy then 0.8 to the probes ammount
+        pathCommandVector.erase(std::remove_if(pathCommandVector.begin(), pathCommandVector.end(),
+            [&](const std::pair<String, std::set<uint8_t>>& pair) {
+                return pair.second.size() < 0.8 * node->probes;
+            }), pathCommandVector.end());
+
+        // Sort by response time (smallest set = most consistent)
+        std::sort(pathCommandVector.begin(), pathCommandVector.end(),
+            [](const std::pair<String, std::set<uint8_t>>& a, const std::pair<String, std::set<uint8_t>>& b) {
+                return a.second.size() < b.second.size();
+            });
+
+        // Print results or do whatever processing you need
+        Serial.printf("Found %d paths after filtering\n", pathCommandVector.size());
+
+        //show all paths
+        for (const auto& pair : pathCommandVector) {
+            Serial.println("Path: " + pair.first);
+            Serial.printf("Path stability: %d/%d responses\n",
+                         pair.second.size(), node->probes);
+        }
+
+        Serial.println("--------------------------------------------------");
+
+        if (!pathCommandVector.empty()) {
+            Serial.println("Most stable path: " + pathCommandVector.back().first);
+            Serial.printf("Path stability: %d/%d responses\n",
+                         pathCommandVector.back().second.size(), node->probes);
+        } else {
+            Serial.println("No stable path found");
+            Serial.printf("Total paths before filtering: %d\n", node->pathCommandMap.size());
+            Serial.printf("Required stability threshold: %.1f responses\n", 0.8 * node->probes);
+        }
+
+        // Task completed, delete itself
+        vTaskDelete(NULL);
     }
 
     bool Node::sendDataBlocking(const struct_message &msg, uint32_t timeout_ms, int maxRetries)
@@ -134,7 +245,10 @@ namespace NuggetsInc
         }
 
         struct_message messageToSend = msg;
-        prepareMessage(messageToSend, false);
+
+        if (messageToSend.destinationMac == 0) {
+            prepareMessage(messageToSend, false);
+        }
 
         if (xQueueSend(outgoingQueue, &messageToSend, pdMS_TO_TICKS(10)) != pdPASS) {
             Serial.println("Failed to queue outgoing message (non-blocking)");
@@ -143,6 +257,7 @@ namespace NuggetsInc
 
         return true;
     }
+    
 
     bool Node::isPeerIntialized()
     {
@@ -166,30 +281,28 @@ namespace NuggetsInc
     {
         if (activeInstance)
         {
+            activeInstance->handleOnDataRecv(mac_addr, incomingData, len);
+        }
+    }
+
+    void Node::handleOnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) { 
+        if (activeInstance)
+        {
             if (len >= sizeof(struct_message)) {
                 struct_message receivedMessage;
                 memcpy(&receivedMessage, incomingData, sizeof(struct_message));
 
-                // Null-terminate string fields for safety
                 receivedMessage.messageType[sizeof(receivedMessage.messageType) - 1] = '\0';
                 receivedMessage.data[sizeof(receivedMessage.data) - 1] = '\0';
                 receivedMessage.path[sizeof(receivedMessage.path) - 1] = '\0';
 
-                // If a peer wasn't previously connected, add it now
                 if (!activeInstance->peerIntialized)
                 {
                     memcpy(activeInstance->peerMAC, mac_addr, 6);
-                    Serial.print("Stored peer MAC: ");
-                    for (int i = 0; i < 6; i++) {
-                        Serial.printf("%02X", activeInstance->peerMAC[i]);
-                        if (i < 5) Serial.print(":");
-                    }
-                    Serial.println();
+                    Router::printMac(mac_addr, "Stored peer MAC: ");
                     activeInstance->addPeer(mac_addr);
                 }
-                Serial.flush();
 
-                // Now delegate to MessageHandler
                 if (activeInstance->messageHandler_) {
                     activeInstance->messageHandler_->processReceivedMessage(mac_addr, receivedMessage);
                 }
@@ -201,7 +314,7 @@ namespace NuggetsInc
     {
         if (status != ESP_NOW_SEND_SUCCESS)
         {
-            Serial.println("Data send failed");
+            Router::printMac(mac_addr, "Failed to send data to: ");
         }
     }
 
@@ -219,12 +332,7 @@ namespace NuggetsInc
     void Node::setSelfMac(uint8_t out[6])
     {
         String macStr = WiFi.macAddress();
-        int b[6];
-        if (sscanf(macStr.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6)
-        {
-            for (int i = 0; i < 6; i++)
-                out[i] = (uint8_t)b[i];
-        }
+        Router::stringToMac(macStr, out);
     }
 
     void Node::addPeer(const uint8_t *mac_addr)
@@ -235,13 +343,17 @@ namespace NuggetsInc
             peerInfo.channel = 1;
             peerInfo.encrypt = false;
 
-            if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+            esp_err_t result = esp_now_add_peer(&peerInfo);
+            if (result == ESP_OK) {
                 peerIntialized = true;
+                Router::printMac(mac_addr, "Successfully added peer: ");
             } else {
-                Serial.println("Failed to add peer");
+                Router::printMac(mac_addr, "Failed to add peer: ");
+                Serial.printf("Error: %s (%d)\n", esp_err_to_name(result), result);
             }
         } else {
             peerIntialized = true;
+            Router::printMac(mac_addr, "Peer already exists: ");
         }
     }
 
@@ -251,11 +363,7 @@ namespace NuggetsInc
         static uint32_t nonBlockingCounter = 0x80000000u;
 
         msg.messageID = isBlocking ? blockingCounter++ : nonBlockingCounter++;
-        
-        // Set sender MAC
         memcpy(msg.SenderMac, selfMAC_, 6);
-
-        // Clear destination MAC and path
         memset(msg.destinationMac, 0, sizeof(msg.destinationMac));
         msg.path[0] = '\0';
     }
@@ -269,13 +377,40 @@ namespace NuggetsInc
         {
             if (xQueueReceive(instance->outgoingQueue, &message, portMAX_DELAY) == pdPASS)
             {
-                if (esp_now_is_peer_exist(instance->peerMAC)) {
-                    esp_err_t result = esp_now_send(instance->peerMAC, reinterpret_cast<uint8_t *>(&message), sizeof(message));
-                    if (result != ESP_OK)
-                    {
-                        Serial.printf("Failed to send data via ESP-NOW: %s (%d)\n", esp_err_to_name(result), result);
+                uint8_t* sendTo = nullptr;
+
+                if (!Router::checkValidMac(message.destinationMac)) {
+                    sendTo = instance->peerMAC;
+                } else {
+                    uint8_t* pathMac = Router::getLastMacFromPath(message.path);
+                    Router::printMac(pathMac, "Sending to: ");
+
+                    if (pathMac) {
+                        sendTo = pathMac;
+                    } 
+                }
+
+                if (sendTo == nullptr) {
+                    Serial.println("ERROR: SENDTO is null!");
+                    continue;
+                }
+
+                if (!esp_now_is_peer_exist(sendTo)) {
+                    Router::printMac(sendTo, "Peer not registered: ");
+                    instance->addPeer(sendTo);
+
+                    if (!esp_now_is_peer_exist(sendTo)) {
+                        continue;
                     }
                 }
+
+                esp_err_t result = esp_now_send(sendTo, reinterpret_cast<uint8_t *>(&message), sizeof(message));
+
+                if (result != ESP_OK)
+                {
+                    Serial.printf("Failed to send data via ESP-NOW: %s (%d)\n", esp_err_to_name(result), result);
+                    Serial.printf("Message size: %d bytes\n", sizeof(message));
+                } 
             }
         }
     }

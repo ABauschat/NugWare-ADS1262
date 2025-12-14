@@ -1,6 +1,6 @@
 #include "DisplayUtils.h"
-#include "Communication/Node.h"
 #include "Communication/NodeService.h"
+#include "Communication/Node.h"
 #include "Communication/HandleEvents.h"
 #include "Communication/MessageTypes.h"
 

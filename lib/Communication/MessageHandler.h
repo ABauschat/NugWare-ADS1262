@@ -47,6 +47,8 @@ private:
     String macToString(const uint8_t mac[6]);
     bool stringToMac(const String& s, uint8_t out[6]);
     bool isDestinationForSelf(const struct_message& msg);
+    void processForwardedMessage(const struct_message& cmdMsg);
+    void processRelayConnectionMessage(const uint8_t* senderMac, const struct_message& cmdMsg);
 };
 
 } // namespace NuggetsInc

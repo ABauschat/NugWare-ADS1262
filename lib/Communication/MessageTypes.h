@@ -12,8 +12,8 @@ struct struct_message
     char messageType[10];
     uint8_t commandID;
     char data[50];
-    uint8_t destinationMac[6]; // Target device MAC for routed delivery; zeros for direct/legacy
-    char path[128];            // Comma-separated MAC path taken so far; empty for direct
+    uint8_t destinationMac[6] = {0};
+    char path[50];           
 };
 
 enum DisplayCommandID : uint8_t {
@@ -40,6 +40,7 @@ enum DisplayCommandID : uint8_t {
     CMD_PLOT_POINT            = 0x15,
     CMD_RELAY_CONNECTION      = 0x16,
     CMD_SYNC_NODES            = 0x17,
+    CMD_RELAY_ESTABLISH       = 0x18,
 };
 #pragma pack(pop)
 

@@ -1,21 +1,62 @@
 #include "NodeService.h"
 #include "MessageTypes.h"
+#include "Router.h"
 #include <cstring>
 #include <WiFi.h>
 
 namespace NuggetsInc {
 
+NodeService::NodeService(Node* node) : node_(node), router_(new Router()) {}
+
 void NodeService::buildCommandMessage(struct_message& out,
                                       uint8_t commandID,
                                       const char* data) {
+    
     memset(&out, 0, sizeof(out));
     strcpy(out.messageType, "cmd");
     out.commandID = commandID;
+    out.path[0] = '\0';
+    out.destinationMac[0] = '\0';
+
     if (data) {
         strncpy(out.data, data, sizeof(out.data)-1);
         out.data[sizeof(out.data)-1] = '\0';
     } else {
         out.data[0] = '\0';
+    }
+}
+
+void NodeService::buildProbeMessage(struct_message& out, uint8_t* destinationMac, uint8_t* senderMac) {
+    memset(&out, 0, sizeof(out));
+    strcpy(out.messageType, "cmd");
+    out.commandID = CMD_RELAY_CONNECTION;
+    memcpy(out.destinationMac, destinationMac, 6);
+    memcpy(out.SenderMac, senderMac, 6);
+    out.data[0] = '\0';
+    out.path[0] = '\0';
+}
+
+void NodeService::createPathWithMac(struct_message& out, uint8_t* mac) {
+    const char* path = router_->macToString(mac).c_str();
+
+    if (path) {
+        strncpy(out.path, path, sizeof(out.path)-1);
+        out.path[sizeof(out.path)-1] = '\0';
+    } else {
+        out.path[0] = '\0';
+    }
+}
+
+void NodeService::setMessageID(struct_message& out, uint32_t messageID) {
+    out.messageID = messageID;
+}
+
+void NodeService::setPath(struct_message& out, const char* path) {
+    if (path) {
+        strncpy(out.path, path, sizeof(out.path)-1);
+        out.path[sizeof(out.path)-1] = '\0';
+    } else {
+        out.path[0] = '\0';
     }
 }
 

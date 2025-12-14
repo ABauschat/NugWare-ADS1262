@@ -7,6 +7,7 @@
 #include "Utils/MenuService.h"
 #include <Arduino.h>
 #include "HX711.h"   // Include the HX711 library
+#include "Utils/LoadCellReader.h"
 
 namespace NuggetsInc {
 
@@ -25,8 +26,11 @@ private:
     void executeSelection();
     void onExitSelection();
     void setupMenu();
+    void updateWeightDisplay();
 
     MenuService* menuService;
+    LoadCellReader* loadCell;
+    unsigned long lastWeightUpdate;
     static MenuState* activeInstance;
 };
 
