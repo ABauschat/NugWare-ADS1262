@@ -15,8 +15,9 @@ static HX711 hx711;
 
 
 ADS1262::ADS1262(const PinConfig& config)
-    : pins(config), spiSettings(1000000, MSBFIRST, SPI_MODE1) {
-    // Init debug buffer
+    : pins(config), spiSettings(1000000, MSBFIRST, SPI_MODE1),
+      initialized(false), lastValidReading(0), consecutiveDrdyTimeouts(0),
+      filterInit(false), filteredValue(0.0f) {
     for (int i = 0; i < 6; ++i) lastBytes[i] = 0;
 }
 
@@ -104,98 +105,155 @@ bool ADS1262::begin() {
     delay(100);
 
     printf("[ADS1262] begin() complete - SUCCESS\n");
+    initialized = true;
+    consecutiveDrdyTimeouts = 0;
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// reconfigure() – re-write all ADC registers without re-initialising SPI.
+// Call this after a lock-up to bring the ADC back to a known state.
+// ---------------------------------------------------------------------------
+bool ADS1262::reconfigure() {
+    printf("[ADS1262] reconfigure() called – re-writing registers\n");
 
+    // Ensure CS is deasserted and START is held HIGH before touching the bus
+    digitalWrite(pins.cs, HIGH);
+    digitalWrite(pins.start, HIGH);
+    delay(5);
 
+    // Hardware reset via SPI command
+    SPI.beginTransaction(spiSettings);
+    digitalWrite(pins.cs, LOW);
+    spiTransfer(CMD_RESET);
+    digitalWrite(pins.cs, HIGH);
+    SPI.endTransaction();
+    delay(100);  // ADS1262 needs ~50 ms after reset
+
+    // Re-apply the same register config as begin()
+    writeReg(0x01, 0x11);  // POWER - normal
+    delay(5);
+    writeReg(0x02, 0x00);  // INTERFACE - 3-byte data, no STATUS/CRC
+    delay(5);
+    writeReg(0x03, 0x07);  // MODE0 - 100 SPS default (MEDIUM); setDataRate() overrides
+    delay(5);
+    writeReg(0x04, 0x86);  // MODE1 - SINC4, CHOP enabled
+    delay(5);
+    writeReg(0x05, 0x30);  // MODE2 - 8x gain
+    delay(5);
+    writeReg(0x06, 0x01);  // INPMUX - AIN0 vs AIN1
+    delay(5);
+    writeReg(0x0F, 0x52);  // REFMUX - External ref AIN2/AIN3
+    delay(5);
+
+    // Restart conversions
+    digitalWrite(pins.start, HIGH);
+    delay(50);
+
+    consecutiveDrdyTimeouts = 0;
+    // DO NOT reset lastValidReading here: if the filter is at 100 g when we
+    // reconfigure, the next DRDY timeout (during ADC restart) should still
+    // return the last good 100 g reading rather than a jarring 0.
+    printf("[ADS1262] reconfigure() complete\n");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// readData() – wait for DRDY then clock out 3 bytes.
+//
+// DRDY detection strategy for the ADS1262:
+//   The ADS1262 DOUT pin is dual-purpose:
+//     • During an SPI read (CS LOW)  → carries conversion data
+//     • While idle        (CS HIGH)  → mirrors the DRDY signal (goes LOW when
+//                                       a new result is ready)
+//   Because CS is HIGH here, the ESP32 SPI peripheral is idle and is NOT
+//   driving MISO.  The ADS1262 is driving DOUT/MISO LOW as a DRDY signal,
+//   and digitalRead() on the MISO pin can safely detect it.
+//
+//   If the board also has a separate dedicated DRDY wire (pins.dready), we
+//   check that too.  Either pin going LOW is sufficient.
+// ---------------------------------------------------------------------------
 int32_t ADS1262::readData() {
-    // CRITICAL: Wait for DRDY to go LOW (data ready)
     uint32_t t0 = micros();
     bool drdyLow = false;
     uint32_t waitTime = 0;
 
     while (true) {
-        int d6 = digitalRead(pins.dready);   // dedicated DRDY
-        int d5 = digitalRead(pins.dout);     // DOUT/DRDY (MISO) also asserts DRDY low on many boards
-        if (d6 == LOW || d5 == LOW) { drdyLow = true; break; }
-
-        waitTime = micros() - t0;
-        if (waitTime > 100000) { // 100 ms safety timeout
+        // Check dedicated DRDY pin AND DOUT/MISO (ADS1262 drives both when idle).
+        // CS is HIGH here so the SPI peripheral is NOT driving MISO – only the
+        // ADS1262 can, and it does so to signal data ready.
+        if (digitalRead(pins.dready) == LOW || digitalRead(pins.dout) == LOW) {
+            drdyLow = true;
             break;
         }
+        waitTime = micros() - t0;
+        if (waitTime > 100000) break;   // 100 ms hard timeout
         delayMicroseconds(10);
     }
 
     if (!drdyLow) {
-        static uint8_t warn = 0;
-        if (warn < 3) {
-            printf("[ADS1262] DRDY timeout after %lu us (D6=%d, D5=%d), trying read anyway\n",
-                   waitTime, digitalRead(pins.dready), digitalRead(pins.dout));
-            warn++;
+        consecutiveDrdyTimeouts++;
+        printf("[ADS1262] DRDY timeout #%u after %lu us – returning last good value\n",
+               consecutiveDrdyTimeouts, waitTime);
+
+        if (consecutiveDrdyTimeouts >= ADC_REINIT_THRESHOLD) {
+            printf("[ADS1262] %u consecutive timeouts – triggering reconfigure()\n",
+                   consecutiveDrdyTimeouts);
+            reconfigure();
         }
-        // fall-through to attempt read to help diagnose wiring
+        // Return the last confirmed-good reading to keep the filter stable.
+        return lastValidReading;
     }
 
-    // Use RDATA1 command (0x12) to read ADC1 conversion data
-    // This is the proper way to read data in continuous conversion mode
+    // DRDY fired – reset the timeout counter.
+    consecutiveDrdyTimeouts = 0;
+
+    // Clock out the conversion result via RDATA1 command.
     SPI.beginTransaction(spiSettings);
     digitalWrite(pins.cs, LOW);
-    delayMicroseconds(2);  // t(CSSC) = CS low to first SCLK
+    delayMicroseconds(2);  // t(CSSC)
 
-    // Send RDATA1 command
-    spiTransfer(0x12);  // RDATA1 command
-    delayMicroseconds(1);  // Small delay after command
+    spiTransfer(0x12);     // RDATA1 command
+    delayMicroseconds(1);
 
-    // ADS1262 outputs 24-bit (3 bytes) conversion data for ADC1
-    // (STATUS and CRC are disabled in INTERFACE register, so only 3 bytes)
     uint8_t b[3];
-    for (int i = 0; i < 3; ++i) {
-        b[i] = spiTransfer(0x00);  // Clock out data bytes
-    }
+    for (int i = 0; i < 3; ++i) b[i] = spiTransfer(0x00);
 
     digitalWrite(pins.cs, HIGH);
     SPI.endTransaction();
 
-    // Combine 3 bytes into 24-bit signed value
+    // Combine 3 bytes → signed 24-bit
     int32_t raw24 = ((int32_t)b[0] << 16) | ((int32_t)b[1] << 8) | b[2];
+    if (raw24 & 0x800000) raw24 |= 0xFF000000;  // sign extend
 
-    // Sign extend from 24-bit to 32-bit
-    if (raw24 & 0x800000) {
-        raw24 |= 0xFF000000;
+    // Periodic debug (every 500 reads) so we keep seeing raw ADC health without
+    // flooding the log.  Still prints anomalies (saturation, all-FF, all-00) always.
+    static uint32_t dbg_count = 0;
+    ++dbg_count;
+    bool allZero = (b[0] == 0x00 && b[1] == 0x00 && b[2] == 0x00);
+    bool allFF   = (b[0] == 0xFF && b[1] == 0xFF && b[2] == 0xFF);
+    bool anomaly = (raw24 >= 8388600) || (raw24 <= -8388600) || allFF || allZero;
+    if (anomaly || (dbg_count % 500 == 1)) {
+        float voltage_mV = ((float)raw24 / 8388608.0f) * (3300.0f / 8.0f);
+        printf("[ADS1262] #%lu Raw24:%10ld (%+7.3f mV) Bytes:%02X %02X %02X DRDY:%lu us%s%s%s\n",
+               (unsigned long)dbg_count, (long)raw24, voltage_mV,
+               b[0], b[1], b[2], waitTime,
+               (raw24 >= 8388600)  ? " **POS_SAT**" : "",
+               (raw24 <= -8388600) ? " **NEG_SAT**" : "",
+               anomaly && !(raw24 >= 8388600) && !(raw24 <= -8388600) ? " **BAD_BYTES**" : "");
     }
 
-    // Calculate voltage for diagnostics
-    // V = (ADC_code / 2^23) * (Vref / Gain)
-    // Vref = excitation voltage (AIN2-AIN3), Gain = 8x, 2^23 = 8388608
-    // For ratiometric measurement, we assume Vref = excitation voltage (typically 3.3V or 5V)
-    // Using 3.3V as typical excitation voltage for now
-    float voltage_mV = ((float)raw24 / 8388608.0f) * (3300.0f / 8.0f);
-
-    // Debug output - EVERY READ for diagnosis
-    static uint8_t dbg_count = 0;
-    if (dbg_count < 100) {
-        printf("[ADS1262] Raw24:%10ld (%+7.3f mV) Bytes:%02X %02X %02X DRDY:%lu us",
-               (long)raw24, voltage_mV, b[0], b[1], b[2], waitTime);
-
-        // Check for saturation (24-bit full scale is ±2^23 = ±8388608)
-        if (raw24 >= 8388600) {
-            printf(" **POS_SAT**");
-        } else if (raw24 <= -8388600) {
-            printf(" **NEG_SAT**");
-        }
-
-        // Check for suspicious patterns
-        if (b[0] == 0xFF && b[1] == 0xFF && b[2] == 0xFF) {
-            printf(" **ALL_FF**");
-        } else if (b[0] == 0x00 && b[1] == 0x00 && b[2] == 0x00) {
-            printf(" **ALL_00**");
-        }
-
-        printf("\n");
-        dbg_count++;
+    // Reject all-zero bytes: the ADS1262 outputs 0x00 0x00 0x00 for the first
+    // few conversions after a reset/reconfigure while its pipeline refills.
+    // A real perfectly-balanced bridge reading 0 counts is virtually impossible.
+    // Return the last good value so the IIR filter is not dragged toward zero.
+    if (allZero) {
+        printf("[ADS1262] Post-reset zero detected – returning last good value (%ld)\n",
+               (long)lastValidReading);
+        return lastValidReading;
     }
 
+    lastValidReading = raw24;
     return raw24;
 }
 

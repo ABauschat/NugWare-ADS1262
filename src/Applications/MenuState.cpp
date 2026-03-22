@@ -48,9 +48,38 @@ MenuState* MenuState::activeInstance = nullptr;
             menuService->drawMenu("Calibrated 5g");
         });
 
+        menuService->addMenuItem("Save Calibration", [this]() {
+            if (loadCell) {
+                bool ok = loadCell->saveCalibration();
+                menuService->drawMenu(ok ? "Saved to Flash!" : "Save Failed!");
+            }
+        });
+
         menuService->addMenuItem("Reset Calibration", [this]() {
             if (loadCell) { loadCell->setCalibrationValues(0, 1.0f); }
             menuService->drawMenu("Calibration Reset");
+        });
+
+        // Read speed presets
+        menuService->addMenuItem("Speed: Slow", [this]() {
+            if (loadCell) { loadCell->setReadSpeed(LoadCellReader::SLOW); }
+            menuService->drawMenu("Speed: Slow");
+        });
+
+        menuService->addMenuItem("Speed: Medium", [this]() {
+            if (loadCell) { loadCell->setReadSpeed(LoadCellReader::MEDIUM); }
+            menuService->drawMenu("Speed: Medium");
+        });
+
+        menuService->addMenuItem("Speed: Fast", [this]() {
+            if (loadCell) { loadCell->setReadSpeed(LoadCellReader::FAST); }
+            menuService->drawMenu("Speed: Fast");
+        });
+
+        // Peak hold
+        menuService->addMenuItem("Reset Peak", [this]() {
+            if (loadCell) { loadCell->resetPeak(); }
+            menuService->drawMenu("Peak Reset");
         });
     }
 
@@ -121,7 +150,7 @@ MenuState* MenuState::activeInstance = nullptr;
             }
         }
 
-        // Periodic live weight display (every ~500ms)
+        // Periodic live weight display (interval depends on read speed)
         updateWeightDisplay();
     }
 
@@ -143,36 +172,36 @@ MenuState* MenuState::activeInstance = nullptr;
     {
         if (!loadCell) return;
         unsigned long now = millis();
-        if (now - lastWeightUpdate < 500) return;
+        if (now - lastWeightUpdate < loadCell->getUpdateIntervalMs()) return;
 
+        // readWeight() drives the IIR filter internally and updates peakRaw as a
+        // side-effect, so we only need a single call here.
         float weight = loadCell->readWeight();
-        int32_t raw = loadCell->getLastRawValue();
+        float peak   = loadCell->getPeakWeight();
 
-        // Calculate voltage: V = (ADC_code / 2^23) * (Vref / Gain)
-        // Vref = excitation voltage (AIN2-AIN3), Gain = 8x, 2^23 = 8388608
-        // Using 5V as typical excitation voltage
-        float voltage_mV = ((float)raw / 8388608.0f) * (5000.0f / 8.0f);
-
-        // Compose strings
+        // Compose display strings
         char line1[32];
-        snprintf(line1, sizeof(line1), "Weight: %.2f g", weight);
-        char line2[40];
-        snprintf(line2, sizeof(line2), "Raw:%ld (%+.2fmV)", (long)raw, voltage_mV);
+        snprintf(line1, sizeof(line1), "W: %+.2f g", weight);
+        char line2[32];
+        snprintf(line2, sizeof(line2), "Pk:%+.2f g", peak);
 
-        printf("[MenuState] Weight: %.2f g, Raw: %ld (%+.3f mV)\n", weight, (long)raw, voltage_mV);
+        printf("[MenuState] W: %.2f g  Pk: %.2f g\n", weight, peak);
 
-        // Draw to remote display
+        // Draw header (y=0..57, menu starts at y=60)
         DisplayUtils* d = menuService->getDisplayUtils();
         if (d) {
-            d->fillRect(0, 0, SCREEN_WIDTH, 50, COLOR_BLACK);
-            d->setCursor(4, 10);
+            d->fillRect(0, 0, SCREEN_WIDTH, 58, COLOR_BLACK);
+
+            // Live weight – green, textSize 2 (~16 px tall)
+            d->setCursor(4, 4);
             d->setTextSize(2);
             d->setTextColor(COLOR_GREEN);
             d->println(String(line1));
 
-            d->setCursor(4, 30);
-            d->setTextSize(1);
-            d->setTextColor(COLOR_WHITE);
+            // Peak hold – orange, textSize 2
+            d->setCursor(4, 28);
+            d->setTextSize(2);
+            d->setTextColor(COLOR_ORANGE);
             d->println(String(line2));
         }
 

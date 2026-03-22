@@ -17,20 +17,30 @@ public:
 
     ADS1262(const PinConfig& config);
 
-    bool begin();          // init + configure ADS1262
-    int32_t readData();    // blocking read, returns filtered 32-bit value
+    bool begin();          // init SPI + configure ADS1262 registers
+    bool reconfigure();    // re-write registers only (no SPI re-init); call after lock-up
+    int32_t readData();    // blocking read (waits for DRDY), returns signed 24-bit sample
 
     void getLastBytes(uint8_t out[6]) const;
     void printDiagnostics();  // Print register values for debugging
+
+    // Data-rate control (MODE0 register, bits 3:0)
+    // Values: 0x00=2.5SPS 0x01=5SPS 0x04=20SPS 0x07=100SPS 0x09=1200SPS 0x0E=19200SPS
+    void setDataRate(uint8_t mode0);
 
 private:
     PinConfig    pins;
     SPISettings  spiSettings;
     uint8_t      lastBytes[6];
     bool         initialized;
-    int32_t      lastReading;
+    int32_t      lastValidReading;      // last reading that came from a real DRDY-confirmed sample
 
-    // Simple IIR low-pass state
+    // DRDY watchdog: how many consecutive DRDY timeouts have occurred.
+    // After ADC_REINIT_THRESHOLD consecutive timeouts, reconfigure() is called automatically.
+    uint8_t      consecutiveDrdyTimeouts;
+    static const uint8_t ADC_REINIT_THRESHOLD = 5;
+
+    // Simple IIR low-pass state (unused now; kept for ABI compatibility)
     bool         filterInit;
     float        filteredValue;
 
@@ -84,7 +94,6 @@ private:
     // Additional configuration functions
     void   enableInternalReference();
     void   setInputMux(uint8_t posInput, uint8_t negInput);
-    void   setDataRate(uint8_t dataRate);
     void   startConversion();
 };
 
