@@ -157,10 +157,22 @@ bool LoadCellReader::loadCalibration() {
 
 void LoadCellReader::calibrateZero() {
     printf("[LoadCell] Calibrating zero offset...\n");
-    printf("[LoadCell] Reading 20 filtered samples for zero calibration...\n");
 
-    // Use readRawValue() (IIR-filtered path) so zeroOffset matches the same
-    // values that readWeight() will subtract it from.
+    // Re-seed the IIR filter from a direct ADC read before averaging.
+    // If the filter is still "winding down" from a previous load (e.g. right
+    // after a span calibration weight was removed), the 20-sample average
+    // would include transitional high values and produce a biased zeroOffset.
+    // By reading the ADC directly and setting filteredValue to that result,
+    // all 20 averaging samples start from the true current baseline.
+    for (int i = 0; i < 5; i++) { adc.readData(); delay(10); } // flush ADC pipeline
+    int32_t seed = adc.readData();
+    if (seed != 0) {   // guard against post-reset zeros
+        filteredValue = seed;
+        lastRawValue  = seed;
+        printf("[LoadCell] Filter re-seeded at %ld counts\n", (long)seed);
+    }
+
+    printf("[LoadCell] Reading 20 filtered samples for zero calibration...\n");
     int64_t sum = 0;
     for (int i = 0; i < 20; i++) {
         sum += readRawValue();
